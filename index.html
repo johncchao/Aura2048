@@ -13,6 +13,7 @@ body{background:#1a1a2e;display:flex;flex-direction:column;align-items:center;ju
 .score-box{text-align:center}
 .score-box .label{font-size:10px;color:#a29bfe;text-transform:uppercase}
 .score-box .value{font-size:18px;font-weight:900}
+#restart-btn{background:none;border:1px solid rgba(255,255,255,0.3);color:#fff;font-size:18px;width:36px;height:36px;border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center}
 #game-canvas{border-radius:12px;display:block}
 #overlay{position:fixed;inset:0;background:rgba(0,0,0,.85);display:none;align-items:center;justify-content:center;z-index:10;flex-direction:column;gap:12px}
 #overlay.show{display:flex}
@@ -29,6 +30,7 @@ body{background:#1a1a2e;display:flex;flex-direction:column;align-items:center;ju
   <h1>✦ Aura2048</h1>
   <div class="score-box"><div class="label">Score</div><div class="value" id="score">0</div></div>
   <div class="score-box"><div class="label">Best</div><div class="value" id="best">0</div></div>
+  <button id="restart-btn" onclick="game.confirmRestart()">↺</button>
 </div>
 <canvas id="game-canvas"></canvas>
 <div id="overlay">
@@ -939,35 +941,42 @@ const game = {
     document.getElementById('overlay').classList.remove('show')
     initGrid()
   },
+  confirmRestart() {
+    if(score < 100 || confirm('Restart game? Current progress will be lost.')) {
+      initGrid()
+    }
+  },
   // Continue: pay 1 Star to undo last move
   continueGame() {
+    const self = this
     const tg = window.Telegram && window.Telegram.WebApp
-    if(tg && tg.openInvoice) {
+    if(tg && typeof tg.openInvoice === 'function') {
       const userId = tg.initDataUnsafe && tg.initDataUnsafe.user ? tg.initDataUnsafe.user.id : 'anon'
       fetch('https://aura2048-pay.ryan-r-c-c-r-chang.workers.dev/create-invoice', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user_id: userId })
+        body: JSON.stringify({ user_id: String(userId) })
       })
       .then(r => r.json())
       .then(data => {
         if(data.url) {
           tg.openInvoice(data.url, (status) => {
-            if(status === 'paid') this.executeContinue()
+            if(status === 'paid') self.executeContinue()
+            else if(status === 'failed') console.log('Payment failed')
+            // 'cancelled' = user closed, do nothing
           })
         } else {
           console.log('Invoice error:', data.error)
-          // Fallback: free continue for testing
-          this.executeContinue()
+          alert('Payment unavailable. Try again later.')
         }
       })
       .catch(err => {
         console.log('Network error:', err)
-        this.executeContinue()
+        alert('Network error. Check connection.')
       })
     } else {
-      // Web fallback: free continue for testing
-      this.executeContinue()
+      // Not in Telegram or openInvoice unavailable: free continue
+      self.executeContinue()
     }
   },
   executeContinue() {
@@ -1014,7 +1023,16 @@ const game = {
   // Share challenge (works on both win and game over)
   shareChallenge() {
     const tg = window.Telegram && window.Telegram.WebApp
-    const text = `🧬 I scored ${score} in Aura2048!\n💀 Think you can do better?`
+    // Different tone for win vs lose
+    const texts = gameOver && !won ? [
+      `😭 Aura2048 is brutal... only scored ${score}\n🫵 Think you can do better?`,
+      `💀 Game Over at ${score} points... I dare you to try`,
+      `🤯 This game is addictive! Only ${score} before I died\n👉 Your turn`,
+    ] : [
+      `🏆 Reached 2048 in Aura2048! Score: ${score}\n✦ Come challenge me`,
+      `✦ ${score} points and fully evolved!\n🎮 Can you beat this?`,
+    ]
+    const text = texts[Math.floor(Math.random() * texts.length)]
     const botUrl = 'https://t.me/Aura2048Bot/app'
     if(tg) {
       const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(botUrl)}&text=${encodeURIComponent(text)}`
