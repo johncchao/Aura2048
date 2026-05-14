@@ -1,0 +1,1091 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Aura2048</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#1a1a2e;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;font-family:system-ui,sans-serif;color:#fff;overflow:hidden;touch-action:none}
+#header{width:100%;max-width:420px;display:flex;justify-content:space-between;align-items:center;padding:8px 12px;margin-bottom:8px}
+#header h1{font-size:18px;font-weight:800}
+.score-box{text-align:center}
+.score-box .label{font-size:10px;color:#a29bfe;text-transform:uppercase}
+.score-box .value{font-size:18px;font-weight:900}
+#game-canvas{border-radius:12px;display:block}
+#overlay{position:fixed;inset:0;background:rgba(0,0,0,.85);display:none;align-items:center;justify-content:center;z-index:10;flex-direction:column;gap:12px}
+#overlay.show{display:flex}
+#overlay h2{font-size:28px;margin-bottom:4px}
+#overlay p{font-size:14px;color:#a29bfe}
+#overlay button{background:#6c5ce7;color:#fff;border:none;padding:12px 32px;border-radius:24px;font-size:16px;font-weight:700;cursor:pointer}
+#overlay .share-btn{background:#00b894}
+#overlay .continue-btn{background:linear-gradient(135deg,#f093fb,#f5576c);animation:pulse-btn 1.5s infinite}
+@keyframes pulse-btn{0%,100%{transform:scale(1)}50%{transform:scale(1.05)}}
+</style>
+</head>
+<body>
+<div id="header">
+  <h1>✦ Aura2048</h1>
+  <div class="score-box"><div class="label">Score</div><div class="value" id="score">0</div></div>
+  <div class="score-box"><div class="label">Best</div><div class="value" id="best">0</div></div>
+</div>
+<canvas id="game-canvas"></canvas>
+<div id="overlay">
+  <h2 id="ov-title">Game Over</h2>
+  <p id="ov-msg">No more moves!</p>
+  <button id="ov-continue" class="continue-btn" style="display:none" onclick="game.continueGame()">⭐ Continue (1 Star)</button>
+  <button id="ov-share" class="share-btn" style="display:none" onclick="game.share()">🏆 Share Achievement</button>
+  <button id="ov-challenge" class="share-btn" onclick="game.shareChallenge()">📤 Challenge Friends</button>
+  <button onclick="game.restart()">Play Again</button>
+</div>
+
+<script>
+// ============ CONFIG & SKIN ============
+const SkinManager = {
+  bg: '#16213e',
+  gridBg: '#0f0c29',
+  cellBg: '#1a1a2e',
+  cellRadius: 8,
+  padding: 8,
+  // Number overlay config
+  showNumber: true,
+  numberStyle: {
+    fontSize: 28,
+    color: '#ffffff',
+    // A) 数字透明度随等级递减：高等级图片更纯净
+    // alpha 会被 getNumberAlpha(val) 动态覆盖
+    alpha: 1,
+    shadowColor: 'rgba(0,0,0,0.8)',
+    shadowBlur: 6,
+    showBadge: true,
+    badgeAlpha: 0.5,
+    badgeRadius: 16
+  },
+  // ====== 皮肤目录配置：改这一行切换整套资源 ======
+  skinFolder: 'assets/test_skins_aa',  // e.g. 'assets/test_skins_old', 'assets/cyberpunk', etc.
+  skinExt: '.jpg',                   // e.g. '.png', '.webp'
+  // Auto-generated from skinFolder + skinExt
+  get imagePaths() {
+    const vals = [2,4,8,16,32,64,128,256,512,1024,2048]
+    const map = {}
+    vals.forEach((v, i) => { map[v] = `${this.skinFolder}/${i+1}${this.skinExt}` })
+    return map
+  },
+  images: {},
+  fallbackColors: {
+    2:'#6c5ce7',4:'#a29bfe',8:'#fd79a8',16:'#e17055',
+    32:'#00b894',64:'#00cec9',128:'#fdcb6e',256:'#e84393',
+    512:'#d63031',1024:'#6c5ce7',2048:'#ffd700'
+  },
+  loaded: false,
+  loadAll() {
+    const entries = Object.entries(this.imagePaths)
+    let count = 0
+    return new Promise(resolve => {
+      if(entries.length === 0) { this.loaded = true; resolve(); return }
+      entries.forEach(([val, path]) => {
+        const img = new Image()
+        img.onload = () => { this.images[val] = img; count++; if(count===entries.length){this.loaded=true;resolve()} }
+        img.onerror = () => { count++; if(count===entries.length){this.loaded=true;resolve()} }
+        img.src = path
+      })
+    })
+  },
+  getImage(val) { return this.images[val] || null },
+  getColor(val) { return this.fallbackColors[val] || '#636e72' },
+  // A) 数字透明度：等级越高越透明
+  getNumberAlpha(val) {
+    // 2→0.9, 4→0.85, 8→0.8, 16→0.7, 32→0.6, 64→0.5, 128→0.4, 256→0.3, 512→0.2, 1024→0.12, 2048→0.05
+    const level = Math.log2(val) // 1~11
+    return Math.max(0.05, 1 - (level - 1) * 0.09)
+  }
+}
+
+// ============ B) AUDIO & HAPTICS ============
+const AudioManager = {
+  ctx: null,
+  ready: false,
+  init() {
+    try { this.ctx = new (window.AudioContext || window.webkitAudioContext)() } catch(e) {}
+  },
+  resume() {
+    if(this.ctx && this.ctx.state === 'suspended') {
+      this.ctx.resume().then(() => { this.ready = true })
+    } else if(this.ctx) {
+      this.ready = true
+    }
+  },
+  // Procedural merge sound: short "pop" with pitch based on value
+  playMerge(val) {
+    if(!this.ctx || this.ctx.state !== 'running') return
+    const ctx = this.ctx
+    const osc = ctx.createOscillator()
+    const gain = ctx.createGain()
+    osc.connect(gain)
+    gain.connect(ctx.destination)
+    // Higher value = higher pitch, more satisfying
+    const baseFreq = 220 + Math.log2(val) * 80
+    osc.frequency.setValueAtTime(baseFreq, ctx.currentTime)
+    osc.frequency.exponentialRampToValueAtTime(baseFreq * 1.5, ctx.currentTime + 0.08)
+    gain.gain.setValueAtTime(0.3, ctx.currentTime)
+    gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.15)
+    osc.type = 'sine'
+    osc.start(ctx.currentTime)
+    osc.stop(ctx.currentTime + 0.15)
+  },
+  // Haptic feedback via Telegram API
+  haptic(style) {
+    const tg = window.Telegram && window.Telegram.WebApp
+    if(tg && tg.HapticFeedback) {
+      tg.HapticFeedback.impactOccurred(style || 'light')
+    }
+  }
+}
+
+// ============ GAME STATE ============
+const SIZE = 4
+let grid, score, bestScore, gameOver, won
+let animating = false
+// Undo snapshot for "continue" feature
+let prevGrid = null
+let prevScore = 0
+let continueUsed = false // only allow one continue per game
+// D) Animation state: tiles in motion
+let tileAnimations = [] // {fromR,fromC,toR,toC,val,merged,spawned}
+let animProgress = 0
+const ANIM_DURATION = 120 // ms for slide
+const SPAWN_DURATION = 150 // ms for new tile pop-in
+let spawnTiles = [] // [{r,c,val}] tiles that just appeared
+let spawnProgress = 0
+let mergedTiles = [] // [{r,c,val}] tiles that just merged (for scale pulse)
+let mergeProgress = 0
+const MERGE_DURATION = 200
+
+// ============ CANVAS SETUP ============
+const canvas = document.getElementById('game-canvas')
+const ctx = canvas.getContext('2d')
+let cellSize, gap, canvasSize
+
+function resize() {
+  const w = Math.min(window.innerWidth - 24, 420)
+  canvasSize = w
+  canvas.width = w * 2; canvas.height = w * 2
+  canvas.style.width = w + 'px'; canvas.style.height = w + 'px'
+  ctx.setTransform(2, 0, 0, 2, 0, 0)
+  gap = SkinManager.padding
+  cellSize = (canvasSize - gap * (SIZE + 1)) / SIZE
+}
+
+// ============ GAME LOGIC ============
+function initGrid() {
+  grid = Array.from({length:SIZE}, () => Array(SIZE).fill(0))
+  score = 0; gameOver = false; won = false
+  prevGrid = null; prevScore = 0; continueUsed = false
+  tileAnimations = []; spawnTiles = []; mergedTiles = []
+  animating = false
+  addRandom(); addRandom()
+  save(); render()
+}
+
+function addRandom() {
+  const empty = []
+  for(let r=0;r<SIZE;r++) for(let c=0;c<SIZE;c++) if(grid[r][c]===0) empty.push([r,c])
+  if(!empty.length) return
+  const [r,c] = empty[Math.floor(Math.random()*empty.length)]
+  grid[r][c] = Math.random() < 0.9 ? 2 : 4
+  spawnTiles.push({r, c, val: grid[r][c]})
+}
+
+function move(dir) {
+  if(gameOver || animating) return
+  // Save snapshot for undo/continue
+  prevGrid = grid.map(row => [...row])
+  prevScore = score
+
+  const oldGrid = grid.map(row => [...row])
+  tileAnimations = []
+  mergedTiles = []
+  spawnTiles = []
+
+  // We need to track movements for animation
+  let moved = false
+  if(dir==='left') moved = moveWithAnim(0, 1)
+  else if(dir==='right') moved = moveWithAnim(0, -1)
+  else if(dir==='up') moved = moveWithAnim(1, 1)
+  else if(dir==='down') moved = moveWithAnim(1, -1)
+
+  if(moved) {
+    addRandom()
+    if(!canMove()) { gameOver = true; setTimeout(() => playGameOverAnimation(), ANIM_DURATION + 200) }
+    save()
+    // D) Start animation
+    animating = true
+    animProgress = 0
+    spawnProgress = 0
+    mergeProgress = 0
+    requestAnimationFrame(animateLoop)
+  }
+}
+
+// D) Movement with animation tracking
+function moveWithAnim(axis, direction) {
+  // axis: 0=horizontal, 1=vertical; direction: 1=toward 0, -1=toward SIZE-1
+  let moved = false
+  const getRC = (major, minor) => axis === 0 ? [major, minor] : [minor, major]
+
+  for(let major = 0; major < SIZE; major++) {
+    // Build line in movement direction
+    const line = []
+    const coords = []
+    for(let i = 0; i < SIZE; i++) {
+      const minor = direction === 1 ? i : SIZE - 1 - i
+      const [r, c] = getRC(major, minor)
+      if(grid[r][c] !== 0) {
+        line.push(grid[r][c])
+        coords.push({r, c})
+      }
+    }
+
+    // Merge logic
+    const merged = []
+    const mergedFlags = []
+    let i = 0
+    while(i < line.length) {
+      if(i + 1 < line.length && line[i] === line[i+1]) {
+        merged.push(line[i] * 2)
+        mergedFlags.push(true)
+        score += line[i] * 2
+        // B) Sound + haptic on merge
+        AudioManager.playMerge(line[i] * 2)
+        AudioManager.haptic(line[i] * 2 >= 128 ? 'heavy' : 'light')
+        if(line[i] * 2 === 2048 && !won) { won = true; setTimeout(() => playVictoryAnimation(), ANIM_DURATION + 300) }
+        i += 2
+      } else {
+        merged.push(line[i])
+        mergedFlags.push(false)
+        i++
+      }
+    }
+
+    // Clear the row/col
+    for(let i = 0; i < SIZE; i++) {
+      const minor = direction === 1 ? i : SIZE - 1 - i
+      const [r, c] = getRC(major, minor)
+      grid[r][c] = 0
+    }
+
+    // Place merged results and record animations
+    let srcIdx = 0
+    for(let destIdx = 0; destIdx < merged.length; destIdx++) {
+      const minor = direction === 1 ? destIdx : SIZE - 1 - destIdx
+      const [dr, dc] = getRC(major, minor)
+      grid[dr][dc] = merged[destIdx]
+
+      // Track animation from source(s) to dest
+      const src = coords[srcIdx]
+      if(src.r !== dr || src.c !== dc) moved = true
+      tileAnimations.push({ fromR: src.r, fromC: src.c, toR: dr, toC: dc, val: merged[destIdx] })
+
+      if(mergedFlags[destIdx]) {
+        // Second source tile also animates to same dest
+        const src2 = coords[srcIdx + 1]
+        if(src2.r !== dr || src2.c !== dc) moved = true
+        tileAnimations.push({ fromR: src2.r, fromC: src2.c, toR: dr, toC: dc, val: merged[destIdx] })
+        mergedTiles.push({ r: dr, c: dc, val: merged[destIdx] })
+        srcIdx += 2
+      } else {
+        srcIdx++
+      }
+    }
+  }
+  return moved
+}
+
+function canMove() {
+  for(let r=0;r<SIZE;r++) for(let c=0;c<SIZE;c++) {
+    if(grid[r][c]===0) return true
+    if(c<SIZE-1 && grid[r][c]===grid[r][c+1]) return true
+    if(r<SIZE-1 && grid[r][c]===grid[r+1][c]) return true
+  }
+  return false
+}
+
+// ============ D) ANIMATION LOOP ============
+let lastFrameTime = 0
+
+function animateLoop(timestamp) {
+  if(!lastFrameTime) lastFrameTime = timestamp
+  const dt = timestamp - lastFrameTime
+  lastFrameTime = timestamp
+
+  animProgress = Math.min(animProgress + dt, ANIM_DURATION)
+  const slideT = easeOutQuad(animProgress / ANIM_DURATION)
+
+  // After slide completes, run spawn + merge animations
+  if(animProgress >= ANIM_DURATION) {
+    spawnProgress = Math.min(spawnProgress + dt, SPAWN_DURATION)
+    mergeProgress = Math.min(mergeProgress + dt, MERGE_DURATION)
+  }
+
+  renderAnimated(slideT)
+
+  const allDone = animProgress >= ANIM_DURATION &&
+                  spawnProgress >= SPAWN_DURATION &&
+                  mergeProgress >= MERGE_DURATION
+
+  if(!allDone) {
+    requestAnimationFrame(animateLoop)
+  } else {
+    animating = false
+    lastFrameTime = 0
+    tileAnimations = []
+    spawnTiles = []
+    mergedTiles = []
+    render() // Final clean render
+  }
+}
+
+// Easing: smooth deceleration
+function easeOutQuad(t) { return t * (2 - t) }
+function easeOutBack(t) { const s = 1.5; return 1 + (t - 1) * (t - 1) * ((s + 1) * (t - 1) + s) }
+
+// ============ RENDERING ============
+function render() {
+  ctx.clearRect(0, 0, canvasSize, canvasSize)
+  // Background
+  ctx.fillStyle = SkinManager.gridBg
+  roundRect(0, 0, canvasSize, canvasSize, 12); ctx.fill()
+
+  // Empty cells
+  for(let r=0;r<SIZE;r++) for(let c=0;c<SIZE;c++) {
+    const x = gap + c*(cellSize+gap), y = gap + r*(cellSize+gap)
+    ctx.fillStyle = SkinManager.cellBg
+    roundRect(x, y, cellSize, cellSize, SkinManager.cellRadius); ctx.fill()
+  }
+
+  // Filled cells
+  for(let r=0;r<SIZE;r++) for(let c=0;c<SIZE;c++) {
+    if(grid[r][c] === 0) continue
+    const x = gap + c*(cellSize+gap), y = gap + r*(cellSize+gap)
+    drawTile(x, y, cellSize, grid[r][c], 1)
+  }
+
+  // Update score display
+  document.getElementById('score').textContent = score
+  bestScore = Math.max(bestScore||0, score)
+  document.getElementById('best').textContent = bestScore
+}
+
+// D) Animated render frame
+function renderAnimated(slideT) {
+  ctx.clearRect(0, 0, canvasSize, canvasSize)
+  ctx.fillStyle = SkinManager.gridBg
+  roundRect(0, 0, canvasSize, canvasSize, 12); ctx.fill()
+
+  // Empty cells
+  for(let r=0;r<SIZE;r++) for(let c=0;c<SIZE;c++) {
+    const x = gap + c*(cellSize+gap), y = gap + r*(cellSize+gap)
+    ctx.fillStyle = SkinManager.cellBg
+    roundRect(x, y, cellSize, cellSize, SkinManager.cellRadius); ctx.fill()
+  }
+
+  if(animProgress < ANIM_DURATION) {
+    // Draw sliding tiles (from old positions interpolated to new)
+    // First, collect final positions to avoid drawing grid values
+    const drawn = new Set()
+    for(const anim of tileAnimations) {
+      const fromX = gap + anim.fromC*(cellSize+gap)
+      const fromY = gap + anim.fromR*(cellSize+gap)
+      const toX = gap + anim.toC*(cellSize+gap)
+      const toY = gap + anim.toR*(cellSize+gap)
+      const curX = fromX + (toX - fromX) * slideT
+      const curY = fromY + (toY - fromY) * slideT
+      drawTile(curX, curY, cellSize, anim.val, 1)
+      drawn.add(`${anim.toR},${anim.toC}`)
+    }
+    // Draw non-animated tiles (ones that didn't move)
+    for(let r=0;r<SIZE;r++) for(let c=0;c<SIZE;c++) {
+      if(grid[r][c] === 0) continue
+      if(drawn.has(`${r},${c}`)) continue
+      // Check if this is a spawn tile
+      if(spawnTiles.some(s => s.r===r && s.c===c)) continue
+      const x = gap + c*(cellSize+gap), y = gap + r*(cellSize+gap)
+      drawTile(x, y, cellSize, grid[r][c], 1)
+    }
+  } else {
+    // Slide done: draw all tiles at final positions with merge pulse + spawn pop
+    for(let r=0;r<SIZE;r++) for(let c=0;c<SIZE;c++) {
+      if(grid[r][c] === 0) continue
+      const x = gap + c*(cellSize+gap), y = gap + r*(cellSize+gap)
+      const val = grid[r][c]
+
+      // Check if this tile just merged (scale pulse)
+      const isMerged = mergedTiles.some(m => m.r===r && m.c===c)
+      // Check if this tile just spawned (pop-in)
+      const isSpawn = spawnTiles.some(s => s.r===r && s.c===c)
+
+      let scale = 1
+      if(isMerged && mergeProgress < MERGE_DURATION) {
+        const mt = mergeProgress / MERGE_DURATION
+        // Pulse: grow to 1.2 then back to 1
+        scale = 1 + 0.2 * Math.sin(mt * Math.PI)
+      } else if(isSpawn && spawnProgress < SPAWN_DURATION) {
+        const st = spawnProgress / SPAWN_DURATION
+        scale = easeOutBack(st) * 1.0
+        scale = Math.min(scale, 1)
+      }
+
+      if(scale !== 1) {
+        const cx = x + cellSize/2, cy = y + cellSize/2
+        const sz = cellSize * scale
+        drawTile(cx - sz/2, cy - sz/2, sz, val, 1)
+      } else {
+        drawTile(x, y, cellSize, val, 1)
+      }
+    }
+  }
+
+  // Update score
+  document.getElementById('score').textContent = score
+  bestScore = Math.max(bestScore||0, score)
+  document.getElementById('best').textContent = bestScore
+}
+
+// Draw a single tile at given position/size
+function drawTile(x, y, size, val, globalAlpha) {
+  const img = SkinManager.getImage(val)
+
+  if(img) {
+    // Layer 1: Image with cover-crop + rounded clip
+    ctx.save()
+    ctx.globalAlpha = globalAlpha
+    roundRect(x, y, size, size, SkinManager.cellRadius)
+    ctx.clip()
+    drawImageCover(img, x, y, size)
+    ctx.restore()
+
+    // Layer 2: Number overlay with level-based opacity fade (Feature A)
+    if(SkinManager.showNumber) {
+      const ns = SkinManager.numberStyle
+      const cx = x + size/2, cy = y + size/2
+      const fontSize = val >= 1024 ? ns.fontSize * 0.7 : val >= 128 ? ns.fontSize * 0.85 : ns.fontSize
+      // A) Dynamic alpha: fades as level increases
+      const numAlpha = SkinManager.getNumberAlpha(val)
+
+      // Badge
+      if(ns.showBadge) {
+        ctx.save()
+        ctx.font = `bold ${fontSize}px system-ui`
+        const textWidth = ctx.measureText(val.toString()).width
+        const badgeW = Math.max(textWidth + 16, ns.badgeRadius * 2)
+        const badgeH = fontSize + 12
+        ctx.globalAlpha = ns.badgeAlpha * numAlpha
+        ctx.fillStyle = '#000'
+        roundRect(cx - badgeW/2, cy - badgeH/2, badgeW, badgeH, ns.badgeRadius * 0.6)
+        ctx.fill()
+        ctx.restore()
+      }
+
+      // Number with glow
+      ctx.save()
+      ctx.globalAlpha = numAlpha
+      ctx.font = `bold ${fontSize}px system-ui`
+      ctx.textAlign = 'center'
+      ctx.textBaseline = 'middle'
+      ctx.shadowColor = ns.shadowColor
+      ctx.shadowBlur = ns.shadowBlur
+      ctx.fillStyle = ns.color
+      ctx.fillText(val, cx, cy)
+      ctx.fillText(val, cx, cy) // double for glow
+      ctx.restore()
+    }
+  } else {
+    // Fallback: solid color
+    ctx.save()
+    ctx.globalAlpha = globalAlpha
+    ctx.fillStyle = SkinManager.getColor(val)
+    roundRect(x, y, size, size, SkinManager.cellRadius); ctx.fill()
+    ctx.fillStyle = '#fff'
+    ctx.font = `bold ${val>=1024?18:val>=128?22:26}px system-ui`
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
+    ctx.fillText(val, x+size/2, y+size/2)
+    ctx.restore()
+  }
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath()
+  ctx.moveTo(x+r, y); ctx.lineTo(x+w-r, y)
+  ctx.quadraticCurveTo(x+w, y, x+w, y+r)
+  ctx.lineTo(x+w, y+h-r)
+  ctx.quadraticCurveTo(x+w, y+h, x+w-r, y+h)
+  ctx.lineTo(x+r, y+h)
+  ctx.quadraticCurveTo(x, y+h, x, y+h-r)
+  ctx.lineTo(x, y+r)
+  ctx.quadraticCurveTo(x, y, x+r, y)
+  ctx.closePath()
+}
+
+// Cover-crop: any aspect ratio → centered square
+function drawImageCover(img, dx, dy, dSize) {
+  const sw = img.naturalWidth, sh = img.naturalHeight
+  let sx, sy, sSize
+  if(sw > sh) { sSize = sh; sx = (sw - sh) / 2; sy = 0 }
+  else { sSize = sw; sx = 0; sy = (sh - sw) / 2 }
+  ctx.drawImage(img, sx, sy, sSize, sSize, dx, dy, dSize, dSize)
+}
+
+// ============ VICTORY ANIMATION ============
+const VICTORY_DURATION = 5500 // ms total — cinematic length
+let victoryProgress = 0
+let victoryActive = false
+
+function playVictoryAnimation() {
+  victoryActive = true
+  victoryProgress = 0
+  playVictorySound()
+  AudioManager.haptic('heavy')
+  requestAnimationFrame(victoryLoop)
+}
+
+function victoryLoop(timestamp) {
+  if(!victoryActive) return
+  victoryProgress += 16
+  const t = Math.min(victoryProgress / VICTORY_DURATION, 1)
+
+  // Render the normal board underneath (fading out)
+  ctx.clearRect(0, 0, canvasSize, canvasSize)
+  ctx.save()
+  ctx.globalAlpha = Math.max(0, 1 - t * 1.5)
+  ctx.fillStyle = SkinManager.gridBg
+  roundRect(0, 0, canvasSize, canvasSize, 12); ctx.fill()
+  for(let r=0;r<SIZE;r++) for(let c=0;c<SIZE;c++) {
+    if(grid[r][c] === 0) continue
+    const x = gap + c*(cellSize+gap), y = gap + r*(cellSize+gap)
+    drawTile(x, y, cellSize, grid[r][c], 1)
+  }
+  ctx.restore()
+
+  // Phase 1 (0-0.3): Golden bloom from center
+  if(t < 0.3) {
+    const p = t / 0.3
+    const radius = canvasSize * 0.8 * easeOutQuad(p)
+    const gradient = ctx.createRadialGradient(canvasSize/2, canvasSize/2, 0, canvasSize/2, canvasSize/2, radius)
+    gradient.addColorStop(0, `rgba(255,215,0,${0.6 * p})`)
+    gradient.addColorStop(0.7, `rgba(255,170,0,${0.3 * p})`)
+    gradient.addColorStop(1, 'rgba(255,215,0,0)')
+    ctx.fillStyle = gradient
+    ctx.fillRect(0, 0, canvasSize, canvasSize)
+  }
+
+  // Phase 2 (0.15-0.7): Image grows from center with rotation
+  if(t > 0.15) {
+    const p = Math.min((t - 0.15) / 0.55, 1)
+    const img = SkinManager.getImage(2048)
+    const eased = easeOutBack(p)
+    const size = canvasSize * 0.85 * eased
+    const cx = canvasSize / 2, cy = canvasSize / 2
+
+    if(img) {
+      ctx.save()
+      ctx.translate(cx, cy)
+      // Subtle rotation that settles
+      ctx.rotate(Math.sin(p * Math.PI) * 0.05)
+      ctx.globalAlpha = Math.min(p * 1.5, 1)
+      // Rounded clip
+      roundRect(-size/2, -size/2, size, size, 16)
+      ctx.clip()
+      drawImageCover(img, -size/2, -size/2, size)
+      // Golden border glow
+      ctx.shadowColor = '#ffd700'
+      ctx.shadowBlur = 30 * p
+      ctx.strokeStyle = `rgba(255,215,0,${0.8 * p})`
+      ctx.lineWidth = 3
+      roundRect(-size/2, -size/2, size, size, 16)
+      ctx.stroke()
+      ctx.restore()
+    }
+  }
+
+  // Phase 3 (0.3-1.0): Sparkle ring expanding
+  if(t > 0.3) {
+    const p = (t - 0.3) / 0.7
+    drawVictorySparkles(p, victoryProgress)
+  }
+
+  // Phase 4 (0.5-0.85): "✦ EVOLVED ✦" text with typewriter + glow
+  if(t > 0.5 && t < 0.85) {
+    const p = (t - 0.5) / 0.35
+    const textAlpha = easeOutQuad(p)
+    ctx.save()
+    ctx.globalAlpha = textAlpha
+    ctx.font = 'bold 32px system-ui'
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'middle'
+    // Multi-layer glow
+    ctx.shadowColor = '#ffd700'
+    ctx.shadowBlur = 25 + Math.sin(victoryProgress * 0.01) * 10
+    ctx.fillStyle = '#ffd700'
+    ctx.fillText('✦ EVOLVED ✦', canvasSize/2, canvasSize * 0.15)
+    ctx.shadowBlur = 0
+    ctx.fillStyle = '#fff'
+    ctx.fillText('✦ EVOLVED ✦', canvasSize/2, canvasSize * 0.15)
+    ctx.restore()
+  }
+
+  // Phase 5 (0.7-1.0): Score counter + subtitle
+  if(t > 0.7) {
+    const p = (t - 0.7) / 0.3
+    ctx.save()
+    ctx.globalAlpha = easeOutQuad(p)
+    // Score
+    ctx.font = 'bold 22px system-ui'
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'middle'
+    ctx.fillStyle = '#a29bfe'
+    ctx.fillText(`Score: ${score}`, canvasSize/2, canvasSize * 0.88)
+    // Subtitle
+    ctx.font = '14px system-ui'
+    ctx.fillStyle = 'rgba(255,255,255,0.6)'
+    ctx.fillText('You reached the final evolution', canvasSize/2, canvasSize * 0.93)
+    ctx.restore()
+  }
+
+  // Continuous golden vignette
+  const vigAlpha = Math.min(t * 2, 0.4)
+  const vig = ctx.createRadialGradient(canvasSize/2, canvasSize/2, canvasSize*0.3, canvasSize/2, canvasSize/2, canvasSize*0.7)
+  vig.addColorStop(0, 'rgba(255,215,0,0)')
+  vig.addColorStop(1, `rgba(255,170,0,${vigAlpha})`)
+  ctx.fillStyle = vig
+  ctx.fillRect(0, 0, canvasSize, canvasSize)
+
+  if(t < 1) {
+    requestAnimationFrame(victoryLoop)
+  } else {
+    victoryActive = false
+    setTimeout(() => showOverlay('🎉 2048!', 'You evolved to the max!', true), 600)
+  }
+}
+
+function drawVictorySparkles(progress, time) {
+  ctx.save()
+  const count = 20
+  for(let i = 0; i < count; i++) {
+    const angle = (i / count) * Math.PI * 2 + time * 0.002
+    const baseRadius = canvasSize * (0.2 + progress * 0.25)
+    const wobble = Math.sin(time * 0.008 + i * 1.5) * 15
+    const radius = baseRadius + wobble
+    const sx = canvasSize/2 + Math.cos(angle) * radius
+    const sy = canvasSize/2 + Math.sin(angle) * radius
+    const sparkSize = (2 + Math.sin(time * 0.015 + i * 3) * 2) * (1 - progress * 0.3)
+    const alpha = (0.9 - progress * 0.5) * (0.5 + Math.sin(time * 0.02 + i) * 0.5)
+    ctx.globalAlpha = Math.max(0, alpha)
+    ctx.fillStyle = i % 3 === 0 ? '#ffd700' : i % 3 === 1 ? '#fff' : '#ff6b6b'
+    ctx.beginPath()
+    // Star shape for some, circles for others
+    if(i % 2 === 0) {
+      drawStar(sx, sy, sparkSize, sparkSize * 2.5, 4)
+    } else {
+      ctx.arc(sx, sy, sparkSize, 0, Math.PI * 2)
+    }
+    ctx.fill()
+  }
+  ctx.restore()
+}
+
+function drawStar(cx, cy, innerR, outerR, points) {
+  ctx.beginPath()
+  for(let i = 0; i < points * 2; i++) {
+    const r = i % 2 === 0 ? outerR : innerR
+    const angle = (i / (points * 2)) * Math.PI * 2 - Math.PI / 2
+    const x = cx + Math.cos(angle) * r
+    const y = cy + Math.sin(angle) * r
+    if(i === 0) ctx.moveTo(x, y)
+    else ctx.lineTo(x, y)
+  }
+  ctx.closePath()
+}
+
+function playVictorySound() {
+  if(!AudioManager.ctx || AudioManager.ctx.state !== 'running') return
+  const actx = AudioManager.ctx
+  // Triumphant ascending arpeggio: C5 → E5 → G5 → C6, then sustained chord
+  const notes = [523, 659, 784, 1047]
+  notes.forEach((freq, i) => {
+    const osc = actx.createOscillator()
+    const gain = actx.createGain()
+    osc.connect(gain)
+    gain.connect(actx.destination)
+    osc.frequency.setValueAtTime(freq, actx.currentTime + i * 0.18)
+    gain.gain.setValueAtTime(0.25, actx.currentTime + i * 0.18)
+    gain.gain.exponentialRampToValueAtTime(0.01, actx.currentTime + i * 0.18 + 0.5)
+    osc.type = 'triangle'
+    osc.start(actx.currentTime + i * 0.18)
+    osc.stop(actx.currentTime + i * 0.18 + 0.5)
+  })
+  // Sustained shimmer chord
+  const chord = [523, 659, 784]
+  chord.forEach((freq) => {
+    const osc = actx.createOscillator()
+    const gain = actx.createGain()
+    osc.connect(gain)
+    gain.connect(actx.destination)
+    osc.frequency.setValueAtTime(freq, actx.currentTime + 0.8)
+    gain.gain.setValueAtTime(0.08, actx.currentTime + 0.8)
+    gain.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + 2.5)
+    osc.type = 'sine'
+    osc.start(actx.currentTime + 0.8)
+    osc.stop(actx.currentTime + 2.5)
+  })
+}
+
+// ============ GAME OVER ANIMATION ============
+const GAMEOVER_DURATION = 3500
+let gameoverProgress = 0
+let gameoverActive = false
+
+function playGameOverAnimation() {
+  gameoverActive = true
+  gameoverProgress = 0
+  playGameOverSound()
+  AudioManager.haptic('heavy')
+  requestAnimationFrame(gameoverLoop)
+}
+
+function gameoverLoop(timestamp) {
+  if(!gameoverActive) return
+  gameoverProgress += 16
+  const t = Math.min(gameoverProgress / GAMEOVER_DURATION, 1)
+
+  // Start with normal board
+  render()
+
+  // Phase 1 (0-0.4): Tiles desaturate and darken — "life draining away"
+  if(t < 0.4) {
+    const p = t / 0.4
+    ctx.save()
+    ctx.globalAlpha = p * 0.6
+    ctx.fillStyle = '#000'
+    roundRect(0, 0, canvasSize, canvasSize, 12)
+    ctx.fill()
+    ctx.restore()
+  } else {
+    ctx.save()
+    ctx.globalAlpha = 0.6
+    ctx.fillStyle = '#000'
+    roundRect(0, 0, canvasSize, canvasSize, 12)
+    ctx.fill()
+    ctx.restore()
+  }
+
+  // Phase 2 (0.2-0.6): Tiles "crack" — red fracture lines
+  if(t > 0.2 && t < 0.8) {
+    const p = (t - 0.2) / 0.6
+    ctx.save()
+    ctx.globalAlpha = p * 0.7
+    ctx.strokeStyle = '#ff4444'
+    ctx.lineWidth = 1.5
+    // Draw crack lines across the grid
+    const cracks = 8
+    for(let i = 0; i < cracks; i++) {
+      const seed = i * 137.5
+      const startX = (Math.sin(seed) * 0.5 + 0.5) * canvasSize
+      const startY = (Math.cos(seed * 1.3) * 0.5 + 0.5) * canvasSize
+      ctx.beginPath()
+      ctx.moveTo(startX, startY)
+      let cx = startX, cy = startY
+      const segments = 4 + Math.floor(p * 4)
+      for(let s = 0; s < segments; s++) {
+        cx += (Math.sin(seed + s * 2.1) * 30) * p
+        cy += (Math.cos(seed + s * 1.7) * 30) * p
+        ctx.lineTo(cx, cy)
+      }
+      ctx.stroke()
+    }
+    ctx.restore()
+  }
+
+  // Phase 3 (0.4-0.8): Tiles fall/sink — subtle downward drift
+  if(t > 0.4) {
+    const p = (t - 0.4) / 0.6
+    const drift = p * 8
+    ctx.save()
+    ctx.globalAlpha = 0.15 * p
+    ctx.fillStyle = '#1a1a2e'
+    // Falling particle dust
+    for(let i = 0; i < 15; i++) {
+      const px = (Math.sin(i * 73.7) * 0.5 + 0.5) * canvasSize
+      const py = ((i / 15) * canvasSize + gameoverProgress * 0.05 * (1 + i * 0.1)) % canvasSize
+      ctx.fillRect(px, py, 2, 2 + p * 3)
+    }
+    ctx.restore()
+  }
+
+  // Phase 4 (0.6-1.0): "GAME OVER" text with shake
+  if(t > 0.6) {
+    const p = (t - 0.6) / 0.4
+    const shake = t < 0.8 ? Math.sin(gameoverProgress * 0.3) * (3 - p * 3) : 0
+    ctx.save()
+    ctx.globalAlpha = easeOutQuad(p)
+    ctx.translate(shake, 0)
+    // Shadow text
+    ctx.font = 'bold 34px system-ui'
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'middle'
+    ctx.shadowColor = '#ff0000'
+    ctx.shadowBlur = 15
+    ctx.fillStyle = '#ff4444'
+    ctx.fillText('GAME OVER', canvasSize/2, canvasSize * 0.45)
+    ctx.shadowBlur = 0
+    ctx.fillStyle = '#fff'
+    ctx.font = '14px system-ui'
+    ctx.fillText(`Final Score: ${score}`, canvasSize/2, canvasSize * 0.55)
+    // Emotional hook for monetization
+    ctx.fillStyle = 'rgba(255,255,255,0.5)'
+    ctx.font = '12px system-ui'
+    ctx.fillText('So close... just one more try?', canvasSize/2, canvasSize * 0.62)
+    ctx.restore()
+  }
+
+  if(t < 1) {
+    requestAnimationFrame(gameoverLoop)
+  } else {
+    gameoverActive = false
+    setTimeout(() => showOverlay('Game Over', 'No more moves!'), 400)
+  }
+}
+
+function playGameOverSound() {
+  if(!AudioManager.ctx || AudioManager.ctx.state !== 'running') return
+  const actx = AudioManager.ctx
+  // Descending minor: E4 → D4 → C4 → low rumble
+  const notes = [330, 294, 262, 196]
+  notes.forEach((freq, i) => {
+    const osc = actx.createOscillator()
+    const gain = actx.createGain()
+    osc.connect(gain)
+    gain.connect(actx.destination)
+    osc.frequency.setValueAtTime(freq, actx.currentTime + i * 0.25)
+    gain.gain.setValueAtTime(0.2, actx.currentTime + i * 0.25)
+    gain.gain.exponentialRampToValueAtTime(0.01, actx.currentTime + i * 0.25 + 0.6)
+    osc.type = i < 3 ? 'triangle' : 'sawtooth'
+    osc.start(actx.currentTime + i * 0.25)
+    osc.stop(actx.currentTime + i * 0.25 + 0.6)
+  })
+}
+
+// ============ OVERLAY ============
+function showOverlay(title, msg, showShare) {
+  document.getElementById('ov-title').textContent = title
+  document.getElementById('ov-msg').textContent = msg
+  document.getElementById('ov-share').style.display = showShare ? 'block' : 'none'
+  // Show continue button only on game over + not yet used this game
+  const showContinue = !showShare && !continueUsed && prevGrid !== null
+  const continueBtn = document.getElementById('ov-continue')
+  continueBtn.style.display = showContinue ? 'block' : 'none'
+  continueBtn.className = showContinue ? 'continue-btn' : 'share-btn'
+  document.getElementById('overlay').classList.add('show')
+}
+
+// ============ SAVE/LOAD ============
+function save() {
+  localStorage.setItem('aura2048_grid', JSON.stringify(grid))
+  localStorage.setItem('aura2048_score', score)
+  localStorage.setItem('aura2048_best', bestScore)
+}
+function load() {
+  try {
+    const g = localStorage.getItem('aura2048_grid')
+    const s = localStorage.getItem('aura2048_score')
+    const b = localStorage.getItem('aura2048_best')
+    if(g) { grid=JSON.parse(g); score=parseInt(s)||0; bestScore=parseInt(b)||0; render(); return true }
+  } catch(e) {}
+  return false
+}
+
+// ============ TOUCH INPUT ============
+let touchStartX, touchStartY
+canvas.addEventListener('touchstart', e => {
+  touchStartX = e.touches[0].clientX
+  touchStartY = e.touches[0].clientY
+  e.preventDefault()
+  // Resume audio on first touch (browser autoplay policy)
+  AudioManager.resume()
+}, {passive:false})
+
+canvas.addEventListener('touchend', e => {
+  const dx = e.changedTouches[0].clientX - touchStartX
+  const dy = e.changedTouches[0].clientY - touchStartY
+  const absDx = Math.abs(dx), absDy = Math.abs(dy)
+  if(Math.max(absDx, absDy) < 20) return
+  if(absDx > absDy) move(dx > 0 ? 'right' : 'left')
+  else move(dy > 0 ? 'down' : 'up')
+}, {passive:false})
+
+// Keyboard
+document.addEventListener('keydown', e => {
+  // Resume audio on any user interaction (browser autoplay policy)
+  AudioManager.resume()
+  if(e.key==='ArrowLeft') move('left')
+  else if(e.key==='ArrowRight') move('right')
+  else if(e.key==='ArrowUp') move('up')
+  else if(e.key==='ArrowDown') move('down')
+})
+
+// ============ GAME OBJECT ============
+const game = {
+  restart() {
+    document.getElementById('overlay').classList.remove('show')
+    initGrid()
+  },
+  // Continue: pay 1 Star to undo last move
+  continueGame() {
+    const tg = window.Telegram && window.Telegram.WebApp
+    if(tg && tg.openInvoice) {
+      const userId = tg.initDataUnsafe && tg.initDataUnsafe.user ? tg.initDataUnsafe.user.id : 'anon'
+      fetch('https://aura2048-pay.ryan-r-c-c-r-chang.workers.dev/create-invoice', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: userId })
+      })
+      .then(r => r.json())
+      .then(data => {
+        if(data.url) {
+          tg.openInvoice(data.url, (status) => {
+            if(status === 'paid') this.executeContinue()
+          })
+        } else {
+          console.log('Invoice error:', data.error)
+          // Fallback: free continue for testing
+          this.executeContinue()
+        }
+      })
+      .catch(err => {
+        console.log('Network error:', err)
+        this.executeContinue()
+      })
+    } else {
+      // Web fallback: free continue for testing
+      this.executeContinue()
+    }
+  },
+  executeContinue() {
+    if(!prevGrid || continueUsed) return
+    document.getElementById('overlay').classList.remove('show')
+    // Restore previous state
+    grid = prevGrid.map(row => [...row])
+    score = prevScore
+    gameOver = false
+    continueUsed = true // only once per game
+    animating = false
+    // Remove a random tile to give breathing room
+    const filled = []
+    for(let r=0;r<SIZE;r++) for(let c=0;c<SIZE;c++) if(grid[r][c]>0) filled.push([r,c])
+    if(filled.length > 2) {
+      // Remove the lowest-value tile
+      filled.sort((a,b) => grid[a[0]][a[1]] - grid[b[0]][b[1]])
+      const [rr, rc] = filled[0]
+      grid[rr][rc] = 0
+    }
+    save(); render()
+    AudioManager.haptic('medium')
+    console.log('✨ Continued! One tile removed, good luck.')
+  },
+  // C) Share achievement via Telegram
+  share() {
+    const tg = window.Telegram && window.Telegram.WebApp
+    if(tg) {
+      // Use Telegram's native share URL (works without Inline Mode)
+      const shareText = `✦ I reached 2048 in Aura2048! Score: ${score}\n🎮 Can you beat me?`
+      const botUrl = 'https://t.me/Aura2048Bot/app'
+      const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(botUrl)}&text=${encodeURIComponent(shareText)}`
+      tg.openTelegramLink(shareUrl)
+    } else {
+      // Web fallback
+      const text = `✦ Aura2048: I reached 2048 with ${score} points!\n🎮 Play: https://t.me/Aura2048Bot/app`
+      if(navigator.share) {
+        navigator.share({ title: 'Aura2048', text })
+      } else {
+        navigator.clipboard.writeText(text).then(() => alert('Copied to clipboard!'))
+      }
+    }
+  },
+  // Share challenge (works on both win and game over)
+  shareChallenge() {
+    const tg = window.Telegram && window.Telegram.WebApp
+    const text = `🧬 I scored ${score} in Aura2048!\n💀 Think you can do better?`
+    const botUrl = 'https://t.me/Aura2048Bot/app'
+    if(tg) {
+      const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(botUrl)}&text=${encodeURIComponent(text)}`
+      tg.openTelegramLink(shareUrl)
+    } else {
+      if(navigator.share) {
+        navigator.share({ title: 'Aura2048', text: text + '\n🎮 ' + botUrl })
+      } else {
+        navigator.clipboard.writeText(text + '\n🎮 ' + botUrl).then(() => alert('Copied!'))
+      }
+    }
+  },
+  // ====== DEBUG TOOLS (use in browser console) ======
+  // game.almostWin() — one merge away from 2048
+  almostWin() {
+    document.getElementById('overlay').classList.remove('show')
+    grid = [
+      [1024, 1024, 512, 256],
+      [128,   64,  32,  16],
+      [8,      4,   2,   0],
+      [0,      0,   0,   0]
+    ]
+    score = 30000; gameOver = false; won = false; animating = false
+    save(); render()
+    console.log('🎯 Almost win! Merge the two 1024s (swipe left)')
+  },
+  // game.almostLose() — nearly full board, very few moves left
+  almostLose() {
+    document.getElementById('overlay').classList.remove('show')
+    grid = [
+      [2,    4,   8,  16],
+      [256, 128, 64,  32],
+      [512,  4,   8,  16],
+      [2,  128,  64,  32]
+    ]
+    score = 5000; gameOver = false; won = false; animating = false
+    save(); render()
+    console.log('💀 Almost lose! Very few moves available')
+  },
+  // game.setTile(r, c, val) — place any value at any cell
+  setTile(r, c, val) {
+    if(r<0||r>=SIZE||c<0||c>=SIZE) return console.log('Invalid position')
+    grid[r][c] = val
+    save(); render()
+    console.log(`Set [${r},${c}] = ${val}`)
+  },
+  // game.triggerWin() — instantly trigger victory animation
+  triggerWin() {
+    won = true
+    playVictoryAnimation()
+    console.log('🎉 Victory animation triggered!')
+  },
+  // game.triggerLose() — instantly trigger game over animation
+  triggerLose() {
+    gameOver = true
+    playGameOverAnimation()
+    console.log('💀 Game over animation triggered!')
+  }
+}
+
+// ============ INIT ============
+const tg = window.Telegram && window.Telegram.WebApp
+if(tg) { tg.ready(); tg.expand() }
+
+AudioManager.init()
+resize()
+window.addEventListener('resize', () => { ctx.setTransform(1,0,0,1,0,0); resize(); render() })
+
+SkinManager.loadAll().then(() => {
+  if(!load()) initGrid()
+})
+</script>
+</body>
+</html>
